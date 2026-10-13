@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Portal de Robôs</title>
+<style>
+  body { font-family: system-ui, sans-serif; background: #f4f5f7; margin: 0; color: #1f2937; }
+  main { max-width: 860px; margin: 32px auto; padding: 0 16px; }
+  h1 { margin-bottom: 4px; }
+  .card { background: #fff; border-radius: 8px; padding: 16px 20px; margin: 16px 0; box-shadow: 0 1px 3px rgba(0,0,0,.12); }
+  label { display: block; margin: 10px 0 4px; font-weight: 600; font-size: 14px; }
+  select, input[type=text], input[type=number] { width: 100%; padding: 8px; box-sizing: border-box; border: 1px solid #cbd5e1; border-radius: 6px; }
+  .check { display: flex; gap: 8px; align-items: center; }
+  .check label { margin: 0; }
+  button, a.btn { background: #2563eb; color: #fff; border: 0; border-radius: 6px; padding: 10px 18px; font-size: 15px; cursor: pointer; text-decoration: none; display: inline-block; }
+  button:disabled { background: #94a3b8; cursor: not-allowed; }
+  a.btn.green { background: #16a34a; }
+  .row { display: flex; gap: 12px; align-items: center; margin-top: 16px; flex-wrap: wrap; }
+  .badge { padding: 3px 10px; border-radius: 12px; font-size: 13px; font-weight: 600; }
+  .QUEUED, .PROVISIONING { background: #fef3c7; color: #92400e; }
+  .RUNNING { background: #dbeafe; color: #1e40af; }
+  .SUCCEEDED { background: #dcfce7; color: #166534; }
+  .FAILED { background: #fee2e2; color: #991b1b; }
+  pre { background: #0f172a; color: #e2e8f0; padding: 12px; border-radius: 6px; max-height: 300px; overflow: auto; white-space: pre-wrap; font-size: 12px; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #e5e7eb; }
+  .muted { color: #6b7280; font-size: 13px; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Portal de Robôs</h1>
+  <p class="muted">Escolha o robô, informe os parâmetros e execute. O desktop é aberto no Guacamole assim que estiver pronto.</p>
+
+  <div class="card">
+    <label for="robot">Robô</label>
+    <select id="robot"></select>
+    <div id="params"></div>
+    <div class="row"><button id="run">Executar</button></div>
+  </div>
+
+  <div class="card" id="exec" hidden>
+    <div class="row" style="margin-top:0">
+      <strong id="exec-name"></strong>
+      <span id="exec-status" class="badge"></span>
+      <span id="exec-time" class="muted"></span>
+    </div>
+    <div class="row">
+      <a id="desktop-link" class="btn green" target="_blank" rel="noopener" hidden>Abrir desktop no Guacamole</a>
+    </div>
+    <p id="exec-msg"></p>
+    <details><summary>Logs</summary><pre id="logs"></pre></details>
+  </div>
+
+  <div class="card">
+    <strong>Últimas execuções</strong>
+    <table><thead><tr><th>Robô</th><th>Início</th><th>Duração</th><th>Status</th><th>Executado por</th></tr></thead>
+    <tbody id="history"></tbody></table>
+  </div>
+</main>
+
+<script>
+const WS = "rpa";
+const HIDDEN = ["guac_session"];
+const URL_RE = /Acompanhe o robô em:\s*(\S+)/;
+const $ = (id) => document.getElementById(id);
+let scripts = [];
+let active = null;
+
+async function api(path, opts) {
+  const r = await fetch(`/api/${path}`, { headers: { "Content-Type": "application/json" }, ...opts });
+  if (!r.ok) throw new Error(`${r.status} ${await r.text()}`);
+  const t = await r.text();
+  try { return JSON.parse(t); } catch { return t; }
+}
+
+async function loadScripts() {
+  const all = await api(`w/${WS}/scripts/list?path_start=f/rpa/`);
+  scripts = all.filter((s) => !HIDDEN.some((h) => s.path.endsWith(h)));
+  $("robot").innerHTML = scripts.map((s) => `<option value="${s.path}">${s.summary || s.path}</option>`).join("");
+  renderParams();
+}
+
+async function renderParams() {
+  const path = $("robot").value;
+  if (!path) return;
+  const s = await api(`w/${WS}/scripts/get/p/${path}`);
+  if ($("robot").value !== path) return;
+  const props = (s.schema && s.schema.properties) || {};
+  $("params").innerHTML = Object.entries(props).map(([k, p]) => {
+    const help = p.description ? ` <span class="muted">${p.description}</span>` : "";
+    if (p.type === "boolean")
+      return `<div class="check"><input type="checkbox" id="p-${k}" data-key="${k}" data-type="boolean" ${p.default ? "checked" : ""}><label for="p-${k}">${k}${help}</label></div>`;
+    const num = p.type === "integer" || p.type === "number";
+    return `<label for="p-${k}">${k}${help}</label><input id="p-${k}" data-key="${k}" data-type="${num ? "number" : "string"}" type="${num ? "number" : "text"}" value="${p.default ?? ""}">`;
+  }).join("");
+}
+
+function collectArgs() {
+  const args = {};
+  document.querySelectorAll("#params [data-key]").forEach((el) => {
+    const t = el.dataset.type;
+    if (t === "boolean") args[el.dataset.key] = el.checked;
+    else if (el.value !== "") args[el.dataset.key] = t === "number" ? Number(el.value) : el.value;
+  });
+  return args;
+}
+
+const fmt = (ms) => (ms == null ? "-" : `${(ms / 1000).toFixed(0)}s`);
+
+async function run() {
+  const path = $("robot").value;
+  const name = $("robot").selectedOptions[0].textContent;
+  $("run").disabled = true;
+  $("exec").hidden = false;
+  $("desktop-link").hidden = true;
+  $("exec-name").textContent = name;
+  $("exec-msg").textContent = "";
+  $("logs").textContent = "";
+  setStatus("QUEUED");
+
+  // abre a aba já no clique, antes do await, para não ser bloqueada pelo navegador
+  const tab = window.open("about:blank", "_blank");
+  let id;
+  try {
+    id = await api(`w/${WS}/jobs/run/p/${path}`, { method: "POST", body: JSON.stringify(collectArgs()) });
+  } catch (e) {
+    if (tab) tab.close();
+    $("exec-msg").textContent = `Falha ao iniciar: ${e.message}`;
+    setStatus("FAILED");
+    $("run").disabled = false;
+    return;
+  }
+  active = { id, tab, offset: 0, opened: false, logs: "", started: Date.now() };
+  poll();
+}
+
+function setStatus(s) {
+  const labels = { QUEUED: "Na fila", PROVISIONING: "Preparando desktop", RUNNING: "Em execução", SUCCEEDED: "Finalizado com sucesso", FAILED: "Falhou" };
+  $("exec-status").className = `badge ${s}`;
+  $("exec-status").textContent = labels[s];
+}
+
+async function poll() {
+  const a = active;
+  try {
+    const u = await api(`w/${WS}/jobs_u/getupdate/${a.id}?running=true&log_offset=${a.offset}`);
+    if (u.new_logs) {
+      a.logs += u.new_logs;
+      a.offset = u.log_offset ?? a.offset + u.new_logs.length;
+      $("logs").textContent = a.logs;
+    }
+    $("exec-time").textContent = fmt(Date.now() - a.started);
+    const m = URL_RE.exec(a.logs);
+    if (m && !a.opened) {
+      a.opened = true;
+      $("desktop-link").href = m[1];
+      $("desktop-link").hidden = false;
+      if (a.tab) a.tab.location = m[1];
+    }
+    if (u.completed) return finish(a);
+    setStatus(u.running ? (a.opened ? "RUNNING" : "PROVISIONING") : "QUEUED");
+  } catch (e) {
+    $("exec-msg").textContent = `Erro ao consultar o job: ${e.message}`;
+  }
+  setTimeout(poll, 2000);
+}
+
+async function finish(a) {
+  const job = await api(`w/${WS}/jobs_u/get/${a.id}`);
+  setStatus(job.success ? "SUCCEEDED" : "FAILED");
+  $("exec-time").textContent = fmt(job.duration_ms);
+  $("desktop-link").hidden = true;
+  if (a.tab && !a.opened) a.tab.close();
+  $("exec-msg").textContent = job.success
+    ? `Execução finalizada e registrada em ${new Date(job.completed_at).toLocaleString("pt-BR")}. A conexão com o desktop foi encerrada.`
+    : `A execução falhou: ${(job.result && job.result.error && job.result.error.message) || "veja os logs"}`;
+  $("run").disabled = false;
+  active = null;
+  loadHistory();
+}
+
+async function loadHistory() {
+  const jobs = await api(`w/${WS}/jobs/completed/list?per_page=10&script_path_start=f/rpa/&job_kinds=script`);
+  $("history").innerHTML = jobs.filter((j) => !HIDDEN.some((h) => (j.script_path || "").endsWith(h))).map((j) =>
+    `<tr><td>${j.script_path}</td><td>${new Date(j.started_at || j.created_at).toLocaleString("pt-BR")}</td><td>${fmt(j.duration_ms)}</td>` +
+    `<td><span class="badge ${j.success ? "SUCCEEDED" : "FAILED"}">${j.success ? "Sucesso" : "Falha"}</span></td><td>${j.created_by}</td></tr>`).join("");
+}
+
+$("robot").addEventListener("change", renderParams);
+$("run").addEventListener("click", run);
+loadScripts().then(loadHistory).catch((e) => ($("exec-msg").textContent = e.message, $("exec").hidden = false));
+</script>
+</body>
+</html>

@@ -1,0 +1,135 @@
+services:
+  # Gera o schema SQL do Guacamole uma única vez para o Postgres
+  guac-initdb:
+    image: guacamole/guacamole:1.5.5
+    user: root
+    command: ["/bin/sh", "-c", "/opt/guacamole/bin/initdb.sh --postgresql > /init/001-initdb.sql"]
+    volumes:
+      - guac-init:/init
+
+  postgres:
+    image: postgres:15-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: guacamole_db
+      POSTGRES_USER: guacamole_user
+      POSTGRES_PASSWORD: guacamole_pass
+    volumes:
+      - guac-init:/docker-entrypoint-initdb.d:ro
+      - guac-db:/var/lib/postgresql/data
+    depends_on:
+      guac-initdb:
+        condition: service_completed_successfully
+
+  guacd:
+    image: guacamole/guacd:1.5.5
+    restart: unless-stopped
+
+  guacamole:
+    image: guacamole/guacamole:1.5.5
+    restart: unless-stopped
+    environment:
+      GUACD_HOSTNAME: guacd
+      POSTGRESQL_HOSTNAME: postgres
+      POSTGRESQL_DATABASE: guacamole_db
+      POSTGRESQL_USER: guacamole_user
+      POSTGRESQL_PASSWORD: guacamole_pass
+    ports:
+      - "8080:8080"
+    depends_on:
+      - guacd
+      - postgres
+
+  # Desktop Linux (XFCE + Chromium) acessado pelo Guacamole via VNC.
+  # Perfil "desktop": serve para construir a imagem usada pelos robôs (docker compose --profile desktop build)
+  # e para o uso manual com run.py (docker compose --profile desktop up -d desktop).
+  desktop:
+    build: ./desktop
+    image: rpa-desktop:latest
+    profiles: ["desktop"]
+    restart: unless-stopped
+    shm_size: "2gb"
+    environment:
+      VNC_PASSWORD: guacdesktop
+    ports:
+      - "9224:9223" # CDP do Chromium para o Playwright
+
+  # ---- Windmill: orquestrador (UI/API em http://localhost:8000) ----
+  windmill_db:
+    image: postgres:16
+    restart: unless-stopped
+    shm_size: 1g
+    environment:
+      POSTGRES_PASSWORD: changeme
+      POSTGRES_DB: windmill
+    volumes:
+      - windmill-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  windmill_server:
+    image: ghcr.io/windmill-labs/windmill:main
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgres://postgres:changeme@windmill_db/windmill?sslmode=disable
+      MODE: server
+    ports:
+      - "8000:8000"
+    depends_on:
+      windmill_db:
+        condition: service_healthy
+    volumes:
+      - windmill-logs:/tmp/windmill/logs
+
+  # Worker que executa os robôs. Monta o socket do Docker para criar um desktop por execução:
+  # quem edita scripts no Windmill passa a ter acesso ao daemon Docker do host.
+  windmill_worker:
+    image: ghcr.io/windmill-labs/windmill:main
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgres://postgres:changeme@windmill_db/windmill?sslmode=disable
+      MODE: worker
+      WORKER_GROUP: default
+      # lidas pelos robôs (f/rpa/guac_session)
+      WHITELIST_ENVS: "GUAC_URL,GUAC_PUBLIC_URL,GUAC_USER,GUAC_PASS,DESKTOP_IMAGE,DESKTOP_NETWORK"
+      GUAC_URL: http://guacamole:8080/guacamole
+      GUAC_PUBLIC_URL: http://localhost:8080/guacamole
+      GUAC_USER: guacadmin
+      GUAC_PASS: guacadmin
+      DESKTOP_IMAGE: rpa-desktop:latest
+      DESKTOP_NETWORK: rpa-net
+    depends_on:
+      windmill_db:
+        condition: service_healthy
+    volumes:
+      - windmill-cache:/tmp/windmill/cache
+      - windmill-logs:/tmp/windmill/logs
+      - /var/run/docker.sock:/var/run/docker.sock
+
+  # Portal de autoatendimento para os usuários (http://localhost:8090)
+  portal:
+    image: nginx:alpine
+    restart: unless-stopped
+    environment:
+      WM_TOKEN: ${WM_TOKEN:-}
+    ports:
+      - "8090:80"
+    volumes:
+      - ./windmill/portal/index.html:/usr/share/nginx/html/index.html:ro
+      - ./windmill/portal/default.conf.template:/etc/nginx/templates/default.conf.template:ro
+    depends_on:
+      - windmill_server
+
+networks:
+  default:
+    name: rpa-net
+
+volumes:
+  guac-init:
+  guac-db:
+  windmill-db:
+  windmill-cache:
+  windmill-logs:

@@ -1,0 +1,13 @@
+server {
+    listen 80;
+
+    root /usr/share/nginx/html;
+    index index.html;
+
+    # O navegador nunca vê o token: o nginx o injeta ao encaminhar para o Windmill
+    location /api/ {
+        proxy_pass http://windmill_server:8000;
+        proxy_set_header Authorization "Bearer ${WM_TOKEN}";
+        proxy_read_timeout 60s;
+    }
+}
